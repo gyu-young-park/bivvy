@@ -1,4 +1,4 @@
-**# 1000 라인의 코드로 NOSQL database를 바닥부터 만들어보자.
+# 1000 라인의 코드로 NOSQL database를 바닥부터 만들어보자.
 
 ## Chapter1
 앞으로 go언어로 간단한 NOSQL databawe를 만들 것이다. database의 컨셉을 알려주고, go언어로 NOSQL key/value database를 만드는 데 이 컨셉들을 사용할 수 있는 지 알려줄 것이다. 우리는 다음과 같은 질문에 대해 답을 할 것이다.
