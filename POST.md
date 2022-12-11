@@ -270,3 +270,308 @@ hexdump -C db.db
 첫번째 줄은 0번째 page로 추후에 있을 metadata 영역이다.
 
 우리의 database가 어느정도 프로그램의 구실을 하게되었는지만 치명적인 문제가 있다. 만약 프로그램을 종료하면 페이지를 어디서부터 할당해야하고, 어떤 페이지들이  free되었는 지 기록할 수 없다는 것이다. 즉, `freelist`는 `disk`에 저장되어야 한다는 것이다. 이것이 바로 다음 챕터에서 다룰 내용이다. 
+
+## chapter2
+![사진1](./pic/chapter2/1.png)
+
+우리는 disk 연산들을 처리하는 `Data Access Layer`를 만들었다. 지금까지 database file을 열고, 닫고 disk page들에 데이터를 쓰고 읽고를 지원한다. 또한, 비어있는 페이지와 데이터가 있는 페이지를 관리하는 `freelist`를 만들었다.
+
+chapter2에서는 disk에 persistence를 부여해주도록 하자, 이는 database state를 disk에 저장하기 위해 필요한 것이며, 이를 통해 restart에도 연산이 정확하게 동작하게 만들 수 있다. 이에 대한 기능은 `DAL`에서 책임을 지도록 하자.
+
+`freelist`의 상태를 저장하기 위해서, 우리는 `freelist`의 상태를 데이터 베이스의 페이지로 disk에 저장하도록 하자. 이는 database에 대한 metadata를 저장하도록 하는 것이며, 굉장히 많이 사용되는 패턴이다.
+
+우리의 경우 metadata는 freelist의 필수적인 페이지 숫자가 될 수 있고, 이는 또한 파일 포멧을 식별하기 위한 contant number 또는 text value일 수 있다. 우리의 경우 두 가지 모두이다.
+
+`freelist`의 page number를 추적하기 위해서 우리는 `meta`라고 불리는 새로운 페이지를 추가할 것이다. 이는 특별한 페이지이며 0번 페이지에 기록 된다. 우리는 이 database 프로그램을 다시 시작할 때 마다 0번 페이지를 다시 읽어서 `freelist`에 데이터를 로드시켜줄 것이다.
+
+정리하자면 다음과 같다.
+```
+--------------------
+0번째 page = meta data (freelist byte data page number)
+...
+n번째 page = freelist byte data
+--------------------
+```
+즉 `freelist` 구조체를 바이트로 변환한 후에 페이지에 저장하고, 해당 페이지 번호를 meta구조체가 저장한 다음 0번째 페이지에 써주겠다는 것이다.
+
+### Meta Page Persistence
+데이터 베이스의 전형적인 패턴은 `serialize`와 `deserialize` 메서드들을 만들어서 entity를 single page에 맞는 raw data로 변형시켜주도록 하는 것이다. 그리고 이를 entity를 반환하는 reading, writing 메서드에 wrapping하는 것이다.
+
+우리는 `meta.go`라는 새로운 `meta` 타입을 만들고 생성자를 만들도록 하자.
+
+우리는 `meta`를 `[]byte`로 serialize하여 disk에 데이터를 쓸 수 있도록 하는 것이 필요하다. 안타깝게도, go에서는 `Unsafe` 페키지를 사용하는 방법 외에는 `c`에서 하는 방식처럼 구조체를 binary로 쉽게 변경할 수 있는 기능을 제공하지 않는다. 그래서 우리는 이 기능 자체를 우리들이 직접 구현할 것이다.
+
+- meta.go
+```go
+package main
+
+import "encoding/binary"
+
+const (
+	metaPageNum = 0
+)
+
+type meta struct {
+	freelistPage pgnum
+}
+
+func newEmptyMeta() *meta {
+	return &meta{}
+}
+
+func (m *meta) serialize(buf []byte) {
+	pos := 0
+	binary.LittleEndian.PutUint64(buf[pos:], uint64(m.freelistPage))
+	pos += pageNumSize
+}
+
+func (m *meta) deserialize(buf []byte) {
+	pos := 0
+	m.freelistPage = pgnum(binary.LittleEndian.Uint64(buf[pos:]))
+	pos += pageNumSize
+}
+```
+각 메서드에서 position variable인 (`pos`)를 가져 buffer의 position을 추적하도록 한다. 이는 파일에서의 cursor와 비슷한 기능이다. 
+
+우리는 또한, `pageNumSize`를 정의할 필요가 있다. 이는 `pos`가 한번에 `serialize`하고 `deserialize`하는 크기이다. `uint64`만큼 읽으므로 64bit = 8byte만큼이다. 
+
+- const.go
+```go
+package main
+
+const (
+	pageNumSize = 8
+)
+```
+`const.go` 파일은 각 변수을 저장하기 위해 얼마나 많은 bytes들이 사용되는 지를 알려주고, `serialize`와 `deserialize`는 page내에 어디에 데이터를 저장했는 지를 관리한다.
+
+마침내, 위에서 만든 meta `serialize`와 `deserialize`를 사용하여 `writeMeta`와 `readMeta` 메서드를 추가하도록 하자.
+
+- dal.go
+```go
+func (d *dal) writeMeta(meta *meta) (*page, error) {
+	p := d.allocateEmptyPage()
+	p.num = metaPageNum
+	meta.serialize(p.data)
+
+	err := d.writePage(p)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+func (d *dal) readMeta() (*meta, error) {
+	p, err := d.readPage(metaPageNum)
+	if err != nil {
+		return nil, err
+	}
+	meta := newEmptyMeta()
+	meta.deserialize(p.data)
+	return meta, nil
+}
+```
+`readMeta` 메서드를 먼저 설명하자면, `metaPageNum`인 0번 페이지를 읽은 다음 `meta` 타입의 인스터스를 하나만들어준다. 이후, `deserialize` 메서드를 통해서 `meta page`의 data를 `meta`의 `freelistPage`에 little endian으로 바이트 정렬해준다. 
+
+프로그램이 끝날 때는 `writeMeta`로 `meta` 타입의 인스턴스를 받고, 새로운 `meta page`를 하나만든 다음. 해당 패이지에 `serialize`해준다.
+
+## Freelist Persistence
+우리는 `meta page`를 정의하였고, `freelist` 데이터를 어디에서 찾을 지를 안다. 이제 `freelist` 그 자체를 `reading/writing`해주기 위한 메서드를 추가할 필요가 있다. 이전과 마찬가지로 우리는 `serializaing`과 `deserializing`을 위한 메서드를 추가할 것이다.
+
+- freelist.go
+```go
+func (fr *freelist) serialize(buf []byte) []byte {
+	pos := 0
+	binary.LittleEndian.PutUint16(buf[pos:], uint16(fr.maxPage))
+	pos += 2
+
+	// released page 개수
+	binary.LittleEndian.PutUint16(buf[pos:], uint16(len(fr.releasedPages)))
+	pos += 2
+
+	for _, page := range fr.releasedPages {
+		binary.LittleEndian.PutUint64(buf[pos:], uint64(page))
+		pos += pageNumSize
+	}
+	return buf
+}
+
+func (fr *freelist) deserialize(buf []byte) {
+	pos := 0
+	fr.maxPage = pgnum(binary.LittleEndian.Uint16(buf[pos:]))
+	pos += 2
+
+	// released pages count
+	releasedPagesCount := int(binary.LittleEndian.Uint16(buf[pos:]))
+	pos += 2
+
+	for i := 0; i < releasedPagesCount; i++ {
+		fr.releasedPages = append(fr.releasedPages, pgnum(binary.LittleEndian.Uint64(buf[pos:])))
+		pos += pageNumSize
+	}
+}
+```
+`serialize`는 데이터가 저장된 가장 끝 페이지의 값인 `fr.maxPage`를 `uint16`으로 `buf`의 2byte에 저장한다. 또한, 비어있는 페이지의 개수를 담은 `releasedPage`도 `buf`에 2byte로 저장한다. 이는 `maxPage`과 `releasedPage`를 2byte씩 저장하는 것이다. 
+
+이후부터는 
+
+`meta` 구조체를 누군가 가지고 있어야 하므로, 이를 `dal`구조체에 넣어주도록 하자.
+
+- dal.go
+```go
+type dal struct {
+	file     *os.File
+	pageSize int
+	*freelist
+	*meta
+}
+```
+이제 `dal`에 `meta`구조체에 있는 page number를 사용하여 `freelist` page를 읽고 쓰는 메서드를 추가하자.
+
+- dal.go
+```go
+func (d *dal) readFreelist() (*freelist, error) {
+	p, err := d.readPage(d.freelistPage)
+	if err != nil {
+		return nil, err
+	}
+
+	freelist := newFreelist()
+	freelist.deserialize(p.data)
+	return freelist, nil
+}
+
+func (d *dal) writeFreelist() (*page, error) {
+	p := d.allocateEmptyPage()
+	p.num = d.freelistPage
+	d.freelist.serialize(p.data)
+
+	err := d.writePage(p)
+	if err != nil {
+		return nil, err
+	}
+
+	d.freelistPage = p.num
+	return p, nil
+}
+```
+`writeFreelist`는 `d.freelistPage`번째의 page에 `freelist`를 직렬화한 바이트 코드를 써준다. `readFreelist`는 `d.freelistPage`를 읽어서 `freelist`인스턴스에 값들을 할당해준다.
+
+이제 `dal.go`의 생성자에 `meta`를 사용하여 `freelist`의 값을 저장하고, 불러오게 해보자.
+
+- dal.go
+```go
+
+func newDal(path string, pageSize int) (*dal, error) {
+	dal := &dal{
+		meta:     newEmptyMeta(),
+		pageSize: pageSize,
+	}
+	// exist
+	if _, err := os.Stat(path); err == nil {
+		dal.file, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
+		if err != nil {
+			_ = dal.close()
+			return nil, err
+		}
+
+		meta, err := dal.readMeta()
+		if err != nil {
+			return nil, err
+		}
+		dal.meta = meta
+
+		freelist, err := dal.readFreelist()
+		if err != nil {
+			return nil, err
+		}
+		dal.freelist = freelist
+		// dosen't exist
+	} else if errors.Is(err, os.ErrNotExist) {
+		// init freelist
+		dal.file, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
+		if err != nil {
+			_ = dal.close()
+			return nil, err
+		}
+		dal.freelist = newFreelist()
+		dal.freelistPage = dal.getNextPage()
+		_, err := dal.writeFreelist()
+		if err != nil {
+			return nil, err
+		}
+
+		_, err = dal.writeMeta(dal.meta)
+	} else {
+		return nil, err
+	}
+	return dal, nil
+}
+```
+먼저 `db.db` 파일이 있는 지를 확인한다. 만약 있을 시에는 `meta page`(0번째 페이지)를 읽어서 `freelist page`(freelist 정보가 있음)가 어디에 있는 지 페이지 번호를 알아낸 다음, `readFreelist`로 `deserialize`한다. 
+
+만약, `db.db` 파일이 없다면, 새로 `freelist`를 만들어주고, `freelist`의 정보를 기록하는 `freelistPage`를 넣어주고, `writeFreelist`를 통해서 `serialize`해준다. 이후, `writeMeta`를 통해서 `m.freelistPage`를 0번째 페이지인 `meta page`에 저장해준다.
+
+이제 해당 코드를 실행해보자.
+
+- main.go
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	dal, _ := newDal("db.db", os.Getpagesize())
+
+	p := dal.allocateEmptyPage()
+	p.num = dal.getNextPage()
+	copy(p.data[:], "data")
+
+	_ = dal.writePage(p)
+	_, _ = dal.writeFreelist()
+
+	// close the db
+	_ = dal.close()
+
+	dal, _ = newDal("db.db", os.Getpagesize())
+	p = dal.allocateEmptyPage()
+	p.num = dal.getNextPage()
+	copy(p.data[:], "data2")
+	_ = dal.writePage(p)
+
+	pageNum := dal.getNextPage()
+	dal.releasedPage(pageNum)
+
+	_, _ = dal.writeFreelist()
+}
+```
+먼저 `db.db`를 열고, `data` 페이지에 기록해준다. 그 다음 `dal`연결을 종료한 뒤에 두번째 데이터인 `data2`를 기록한다. 이후 `dal.releasedPage`로 그 다음 페이지를 할당 해제시켜보자. 마지막으로 `dal.writeFreelist()`으로 현재까지의 `freelist` 정보를 `db.db`에 저장시키자.
+
+이렇게 하면, 무조건 맨처음에 시작할 때, `freelistPage` 정보를 기록한다. 따라서 0번째 page는 meta data, 1번째 page는 `freelist`정보이다. 그 다음 2번째, 3번째 페이지에 각각 `data` , `data2` 가 할당된다. 이 후 4번째 `page`는 재할당 되므로 `freelist`에 기록된다. 
+
+`db.db` 내용을 확인해보자.
+```
+hexdump -C db.db
+
+00000000  01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000010  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+*
+00001000  04 00 01 00 04 00 00 00  00 00 00 00 00 00 00 00  |................|
+00001010  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+*
+00002000  64 61 74 61 00 00 00 00  00 00 00 00 00 00 00 00  |data............|
+00002010  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+*
+00003000  64 61 74 61 32 00 00 00  00 00 00 00 00 00 00 00  |data2...........|
+00003010  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+*
+00004000
+```
+`freelist`정보가 기록된 1번째 페이지에 `04 00`은 가장 끝에 있는 페이지의 값을, `01 00`은 released 된 페이지의 수를, `04` released된 페이지의 번호이다.
+
+이후 계속 `main.go`프로그램을 실행하면 데이터가 추가되고 변경되는 것을 확인할 수 있다.
+
+다음 챕터에서는 `B-Tree`에 대해서 알아보고, 이를 활용해 어떻게 데이터를 저장하고 불러오는 지 알아보도록 하자.

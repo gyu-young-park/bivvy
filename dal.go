@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 )
@@ -16,17 +17,51 @@ type dal struct {
 	file     *os.File
 	pageSize int
 	*freelist
+	*meta
 }
 
 func newDal(path string, pageSize int) (*dal, error) {
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
-	if err != nil {
-		return nil, err
-	}
 	dal := &dal{
-		file:     file,
+		meta:     newEmptyMeta(),
 		pageSize: pageSize,
-		freelist: newFreelist(),
+	}
+	// exist
+	if _, err := os.Stat(path); err == nil {
+		dal.file, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
+		if err != nil {
+			_ = dal.close()
+			return nil, err
+		}
+
+		meta, err := dal.readMeta()
+		if err != nil {
+			return nil, err
+		}
+		dal.meta = meta
+
+		freelist, err := dal.readFreelist()
+		if err != nil {
+			return nil, err
+		}
+		dal.freelist = freelist
+		// dosen't exist
+	} else if errors.Is(err, os.ErrNotExist) {
+		// init freelist
+		dal.file, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
+		if err != nil {
+			_ = dal.close()
+			return nil, err
+		}
+		dal.freelist = newFreelist()
+		dal.freelistPage = dal.getNextPage()
+		_, err := dal.writeFreelist()
+		if err != nil {
+			return nil, err
+		}
+
+		_, err = dal.writeMeta(dal.meta)
+	} else {
+		return nil, err
 	}
 	return dal, nil
 }
@@ -68,4 +103,51 @@ func (d *dal) writePage(p *page) error {
 	// offset+p.data의 사이즈만큼, 데이터를 써준다.
 	_, err := d.file.WriteAt(p.data, offset)
 	return err
+}
+
+func (d *dal) writeMeta(meta *meta) (*page, error) {
+	p := d.allocateEmptyPage()
+	p.num = metaPageNum
+	meta.serialize(p.data)
+
+	err := d.writePage(p)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+func (d *dal) readMeta() (*meta, error) {
+	p, err := d.readPage(metaPageNum)
+	if err != nil {
+		return nil, err
+	}
+	meta := newEmptyMeta()
+	meta.deserialize(p.data)
+	return meta, nil
+}
+
+func (d *dal) readFreelist() (*freelist, error) {
+	p, err := d.readPage(d.freelistPage)
+	if err != nil {
+		return nil, err
+	}
+
+	freelist := newFreelist()
+	freelist.deserialize(p.data)
+	return freelist, nil
+}
+
+func (d *dal) writeFreelist() (*page, error) {
+	p := d.allocateEmptyPage()
+	p.num = d.freelistPage
+	d.freelist.serialize(p.data)
+
+	err := d.writePage(p)
+	if err != nil {
+		return nil, err
+	}
+
+	d.freelistPage = p.num
+	return p, nil
 }
