@@ -661,7 +661,81 @@ order 5짜리 b-tree에 데이터 8을 삽입해보자.
 1. leaf 노드에 두고
 2. 만약 leaf 노드안에 m/2 키 이상이 있다면 node노 부터 원하는 키를 삭제한다.
 3. 만약 leaf 노드가 m/2 키들을 포함하고 있지 않으면, 오른쪽 또는 왼쪽 노드로 부터 요소를 가져온다.
-   1. 만약 왼쪽 노드가 m/2 이상 요소들을 가지고 있다면 그 중에 가장 큰 요소를 parent로 올리고, 간섭(intervening) 요소를 키가 삭제된 노드로 이동한다.
-   2. 만약 오른쪽 노드가 m/2 이상 요소들을 가지고 있다면 그 중 가장 작은 요소를 parent로 올리고, 간섭(intervening)요소를 키가 삭제된 노드로 이동한다.
+   1. 만약 왼쪽 노드가 m/2 이상 요소들을 가지고 있다면 그 중에 가장 큰 요소를 parent로 올리고, 간섭(intervening, parent) 요소를 키가 삭제된 노드로 이동한다.
+   2. 만약 오른쪽 노드가 m/2 이상 요소들을 가지고 있다면 그 중 가장 작은 요소를 parent로 올리고, 간섭(intervening, parent)요소를 키가 삭제된 노드로 이동한다.
 4. 만약 양쪽 노드 중 어느 노드도 m/2개의 요소들을 갖고 있지 않으면, 두 개의 leaf 노드들을 joining하고 parent node에 간섭함으소 새로운 leaf node를 만든다.
 5. 만약 parent의 left가 m/2개의 노드보다 작다면 위의 작업을 parent도 반복한다.
+
+만약, leaf node가 아닌 internal node를 삭제하려고 한다면 해당 node를 in-order successor(현재 노드의 오른쪽 child node 중 가장 작은 값, 즉 삭제하려고 하는 값의 바로 다음 값)로 교체하거나 predecessor(현재 노드의 왼쪽 child node 중 가장 큰 값, 즉 삭제하려고 하는 값의 바로 이전 값)로 교체한다. 때문에 successor or predecessor는 항상 leaf node에 있을 것이며, leaf노드 삭제 로직과 동일하게 동작할 것이다. 
+
+노드 53를 order 5인 b-tree에서 53을 삭제한다고 하자. 
+
+![사진2](./pic/chapter3/8.png)
+
+53은 49의 오른쪽 child node이다. 이를 삭제하도록 하자.
+
+![사진2](./pic/chapter3/9.png)
+현재 삭제된 노드는 오직 57밖에 남지 않았다. 각 노드에 최소로 m/2개의 노드가 있어야하는데 5/2 = 2이므로, 1개 밖에 없는 노드는 다른 노드에서 값을 빌려와야 한다. 그런데, 해당 노드의 왼쪽 노드(23,34), 오른쪽 노드(69,74) 모두 m/2개 이므로 값을 빌려올 수가 없다. 이때에는 왼쪽 또는 오른쪽 노드와 merge(합치기)을 하면 된다. 왼쪽 노드를 선택하면, parent node에서 49가 이들 사이에 있으니까 49도 포함해서 합쳐주면 된다.
+
+![사진2](./pic/chapter3/10.png)
+
+그럼 만약, 왼쪽 노드가 23,34,35로 충분한 요소들을 갖고 있었다면 어떻게 될까?? 왼쪽 노드에서 35를 parent로 올리고 parent에서 49를 삭제가 진행된 노드로 내리면 된다.
+
+### coding
+이제 우리의 b-tree를 작성할 시간이 되었다. 우리는 요소에 key-value를 저장할 것이고, key를 기준으로 정렬할 것이다.
+
+![사진2](./pic/chapter3/11.png)
+
+새로운 파일인 `node.go` 파일을 만들고 새로운 타입인 `Node` 타입을 만들어서 b tree의 node를 표현하자. 또한 `Item` 타입을 만들어서 key-value 쌍을 표현하도록 하자.
+
+- node.go
+```go
+package main
+
+type Item struct {
+	key []byte
+	value []byte
+}
+
+type Node struct {
+	*dal
+	pageNum pgnum
+	items []*Item
+	childNodes []pgnum
+}
+
+func NewEmptyNode() *Node {
+	return &Node{}
+}
+
+func newItem(key []byte, value []byte) *Item {
+	return &Item{
+		key: key,
+		value: value,
+	}
+}
+
+func (n *Node) isLeaf() bool {
+	return len(n.childNodes) == 0
+}
+```
+
+우리는 `Node`의 내용들을 disk에 저장하기를 원한다. 이는 key-value-child pointer라는 3쌍둥이를 하나의 page로 저장하는 단순한 일로 보이지만, 이는 실제로 큰 문제점이 있다.
+
+item들은 서로 다른 key, value들을 갖는다. 이는 key-value 쌍들을 순회하는 것이 그리 간단한 작업이라는 것이 아니라는 것을 의미한다. 우리는 각 순회마다 얼만큼 byte를 잡아야 다음 커서로 넘어가는 지를 모르기 때문이다.
+
+![사진2](./pic/chapter3/12.png)
+페이지들은 p로 표시되고, key들은 k, value들은 v로 표시된다.
+
+이러한 문제를 해결하기 위해 우리는 `slotted pages`라는 테크닉을 사용할 것이다. 페이지를 두 가지 메모리 영역으로 나누는 방법이다. page의 끝에는 key와 value들로 이루어져 있고, 반면에 첫부분은 record의 fixed 사이즈의 offset이 있는 것이다.
+
+우리는 또한 헤더를 추가하여 page에 record 수를 포함할 것이다. 그리고 해당 페이지가 leaf인지 아닌지를 알려주는 flag또한 넣을 것이다. (왜냐면, leave들은 child pointer를 갖지 않기 때문이다.)
+
+![사진2](./pic/chapter3/13.png)
+이러한 디자인은 최소한의 노력으로 page에 대한 변화를 가능하게 해준다. logical order은 cell offset들을 저장함으로서 지켜진다. 따라서 data는 다시 재개록 될 필요가 없다.
+
+각 노드들은 단일 페이지로 serialized된다. 그러나 두 개의 차이를 이해하는 것은 매우 종요하다.
+
+`Node`는 오직 key-value 쌍을 포함하고 higher-level에서 사용되는 것이다. 반면에 `Page`는 storage level에서 동작하며 크기가 4KB인 모든 데이터 유형을 저장한다. 이는 또한 key-value 쌍으로 구성된 `slotted page` 구조와 덜 엄격한 구조로 놓여진 `freelist`와 `meta`를 포함할 수 있다.
+
+### Nodes Persistence
