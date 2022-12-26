@@ -682,7 +682,7 @@ order 5짜리 b-tree에 데이터 8을 삽입해보자.
 그럼 만약, 왼쪽 노드가 23,34,35로 충분한 요소들을 갖고 있었다면 어떻게 될까?? 왼쪽 노드에서 35를 parent로 올리고 parent에서 49를 삭제가 진행된 노드로 내리면 된다.
 
 ### coding
-이제 우리의 b-tree를 작성할 시간이 되었다. 우리는 요소에 key-value를 저장할 것이고, key를 기준으로 정렬할 것이다.
+이제 우리의 b-tree를 작성할 시간이 되었다. 우리는 `node`에 key-value를 저장할 것이고, key를 기준으로 정렬할 것이다. 그리고 	`node`와 관련된 key-value와 child값 등등을 `page`의 `data`에 저장하도록 할 것이다. 이렇게 함으로서 `page`에는 `b-tree`의 `node` 정보를 갖고 있어, `page`를 불러오는 것만으로도 `b-tree`를 구성하고 데이터를 서치하기 쉽게 만들 수 있다.  
 
 ![사진2](./pic/chapter3/11.png)
 
@@ -719,8 +719,7 @@ func (n *Node) isLeaf() bool {
 	return len(n.childNodes) == 0
 }
 ```
-
-우리는 `Node`의 내용들을 disk에 저장하기를 원한다. 이는 key-value-child pointer라는 3쌍둥이를 하나의 page로 저장하는 단순한 일로 보이지만, 이는 실제로 큰 문제점이 있다.
+우리는 `Node`의 내용들을 disk에 `page`의 `data`로 저장하기를 원한다. 이는 key-value-child pointer라는 3쌍둥이를 하나의 page로 저장하는 단순한 일로 보이지만, 이는 실제로 큰 문제점이 있다.
 
 item들은 서로 다른 key, value들을 갖는다. 이는 key-value 쌍들을 순회하는 것이 그리 간단한 작업이라는 것이 아니라는 것을 의미한다. 우리는 각 순회마다 얼만큼 byte를 잡아야 다음 커서로 넘어가는 지를 모르기 때문이다.
 
@@ -739,3 +738,162 @@ item들은 서로 다른 key, value들을 갖는다. 이는 key-value 쌍들을 
 `Node`는 오직 key-value 쌍을 포함하고 higher-level에서 사용되는 것이다. 반면에 `Page`는 storage level에서 동작하며 크기가 4KB인 모든 데이터 유형을 저장한다. 이는 또한 key-value 쌍으로 구성된 `slotted page` 구조와 덜 엄격한 구조로 놓여진 `freelist`와 `meta`를 포함할 수 있다.
 
 ### Nodes Persistence
+이전 챕터에서 했듯이 우리는 database node의 serialization과 deserialiation을 추가할 것이다. 이 메서드들은 데이터를 slotted page format으로 만들거나, slotted page format에서 data로 변경해준다.
+
+- node.go
+```go
+func (n *Node) serialize(buf []byte) []byte {
+	leftPos := 0
+	rightPos := len(buf) - 1
+
+	// Add page header: isLeaf, key-value pairs count, node num
+	isLeaf := n.isLeaf()
+	var bitSetVar uint64
+	if isLeaf {
+		bitSetVar = 1
+	}
+	buf[leftPos] = byte(bitSetVar)
+	leftPos += 1
+
+	binary.LittleEndian.PutUint16(buf[leftPos:], uint16(len(n.items)))
+	leftPos += 2
+
+	// We use slotted pages for storing data in the page. It means the actual keys and values (the cells) are appended
+	// to right of the page whereas offsets have a fixed size and are appended from the left.
+	// It's easier to preserve the logical order (alphabetical in the case of b-tree) using the metadata and performing
+	// pointer arithmetic. Using the data itself is harder as it varies by size.
+
+	// Page structure is:
+	// ----------------------------------------------------------------------------------
+	// |  Page  | key-value /  child node    key-value 		      |    key-value		 |
+	// | Header |   offset /	 pointer	  offset         .... |      data      ..... |
+	// ----------------------------------------------------------------------------------
+	for i := 0; i < len(n.items); i++ {
+		item := n.items[i]
+		if !isLeaf {
+			childNode := n.childNodes[i]
+
+			// Write the child page as a fixed size of 8 bytes
+			binary.LittleEndian.PutUint64(buf[leftPos:], uint64(childNode))
+			leftPos += pageNumSize
+		}
+
+		klen := len(item.key)
+		vlen := len(item.value)
+
+		//write offset
+		offset := rightPos - klen - vlen - 2
+		binary.LittleEndian.PutUint16(buf[leftPos:], uint16(offset))
+		leftPos += 2
+
+		rightPos -= vlen
+		copy(buf[rightPos:], item.value)
+
+		rightPos -= 1
+		buf[rightPos] = byte(vlen)
+
+		rightPos -= klen
+		copy(buf[rightPos:], item.key)
+
+		rightPos -= 1
+		buf[rightPos] = byte(klen)
+	}
+
+	if !isLeaf {
+		lastChildNode := n.childNodes[len(n.childNodes)-1]
+		binary.LittleEndian.PutUint64(buf[leftPos:], uint64(lastChildNode))
+	}
+	return buf
+}
+```
+`serialize`메서드를 만들었으니 `deserialize`메서드도 만들어주도록 하자.
+```go
+func (n *Node) deserialize(buf []byte) {
+	leftPos := 0
+
+	// read header
+	isLeaf := uint16(buf[0])
+
+	itemsCount := int(binary.LittleEndian.Uint16(buf[1:3]))
+	leftPos += 3
+
+	for i := 0; i < itemsCount; i++ {
+		if isLeaf == 0 {
+			pageNum := binary.LittleEndian.Uint64(buf[leftPos:])
+			leftPos += pageNumSize
+
+			n.childNodes = append(n.childNodes, pgnum(pageNum))
+		}
+
+		// read offset
+		offset := binary.LittleEndian.Uint16(buf[leftPos:])
+		leftPos += 2
+
+		klen := uint16(buf[int(offset)])
+		offset += 1
+
+		key := buf[offset : offset+klen]
+		offset += klen
+
+		vlen := uint16(buf[int(offset)])
+		offset += 1
+
+		value := buf[offset : offset+vlen]
+		offset += vlen
+
+		n.items = append(n.items, newItem(key, value))
+	}
+
+	if isLeaf == 0 {
+		pageNum := pgnum(binary.LittleEndian.Uint64(buf[leftPos:]))
+		n.childNodes = append(n.childNodes, pageNum)
+	}
+}
+```
+딱히 특별할 것은 없다. 
+
+우리는 또한 node를 반환하기 위해서 `getNode`, `writeNode` 그리고 `deleteNode`를 추가할 것이다. `getNode`와 `writeNode`는 `node` 구조체 자체를 반환하는데, 우리가 이전에 했던 `freelist`와 `meta`가 했던 것과 같다.
+![사진2](./pic/chapter3/14.png)
+
+`deleteNode`는 `freelist`에게 어떤 노드가 삭제될 수 있다는 신호를 보낸다. 그래서 해당 page id가 released되도록 표시해둘 수 있다.
+
+페이지에 우리가 만든 `node` 구조채 정보를 넣어주도록 하는 것이 `getNode`가 되고, `node`구조체의 값을 `page`에 써넣는 것이 `writeNode`가 되겠다.
+- dal.go
+```go
+func (d *dal) getNode(pageNum pgnum) (*Node, error) {
+	p, err := d.readPage(pageNum)
+	if err != nil {
+		return nil, err
+	}
+
+	node := NewEmptyNode()
+	node.deserialize(p.data)
+	node.pageNum = pageNum
+	return node, nil
+}
+
+func (d *dal) writeNode(n *Node) (*Node, error) {
+	p := d.allocateEmptyPage()
+	if n.pageNum == 0 {
+		p.num = d.getNextPage()
+		n.pageNum = p.num
+	} else {
+		p.num = n.pageNum
+	}
+
+	p.data = n.serialize(p.data)
+
+	err := d.writePage(p)
+	if err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
+func (d *dal) deleteNode(pageNum pgnum) {
+	d.releasedPage(pageNum)
+}
+```
+`node`들의 정보를 `page`에 저장하고 불러오는 기능들까지 모두 구현하였다. 이제 `node`들로 `b-tree`를 만들고 `key`를 통해 값을 가져오고, `node`를 정렬하며 삭제하는 방법들을 알아보자.
+
+### Search, Insert, and Delete
