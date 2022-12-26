@@ -897,3 +897,162 @@ func (d *dal) deleteNode(pageNum pgnum) {
 `node`들의 정보를 `page`에 저장하고 불러오는 기능들까지 모두 구현하였다. 이제 `node`들로 `b-tree`를 만들고 `key`를 통해 값을 가져오고, `node`를 정렬하며 삭제하는 방법들을 알아보자.
 
 ### Search, Insert, and Delete
+search, insert, delete를 위한 알고리즘을 구현하기 이전에 node를 쓰고, 읽기 위한 수많은 call들이 만들어질 것이기 때문에, `dal` layer에 만든 코드를 `node`로 wrapping하도록 하자.
+
+```go
+func (n *Node) writeNode(node *Node) *Node {
+	node, _ = n.dal.writeNode(node)
+	return node
+}
+
+func (n *Node) writeNodes(nodes ...*Node) {
+	for _, node := range nodes {
+		n.writeNode(node)
+	}
+}
+
+func (n *Node) getNode(pageNum pgnum) (*Node, error) {
+	return n.dal.getNode(pageNum)
+}
+```
+
+### Search
+b-tree를 검색하는 것은 이진 탐색으로 이루어진다. root node로부터 알고리즘이 시작되고, 검색된 값보다 큰 첫번째 키를 찾을 때까지 모든 키를 travel시킨다. 그러고 나서 우리는 관련된 서브트리 쪽으로 상응하는 child pointer를 이용하여 내려간다. 그리고 이 과정을 반복한다.
+
+![사진2](./pic/chapter3/15.png)
+가령, 20이 주어지면 첫번째 단계에서 20과 정확히 맞는 키가 없다. 그래서 알고리즘은 13보다 더 큰 값으로 가야하므로 p3 포인터를 타고 내려간다. 두 번째 단계에서는 20이 18보다는 크고, 23보다는 작으므로 p6로 가게되고 20을 찾게 된다.
+
+`findKeyInNode` 함수는 위의 예제와 같이 node안의 key를 찾는다. 각 레벨에서 key들을 찾는 key와 비교한다. 만약 찾게되면 funtion은 값을 반환하고, 만약 key를 찾지 못하면 정확한 범위를 반환한다.
+
+- node.go
+```go
+// findKeyInNode iterates all the items and finds the key. If the key is found, then the item is returned. If the key
+// isn't found then return the index where it should have been (the first index that key is greater than it's previous)
+func (n *Node) findKeyInNode(key []byte) (bool, int) {
+	for i, existingItem := range n.items {
+		res := bytes.Compare(existingItem.key, key)
+		if res == 0 {
+			return true, i
+		}
+		// The key is bigger than the previous key, so it doesn't exist in the node, but may exist in child nodes.
+		if res == 1 {
+			return false, i
+		}
+	}
+	// The key isn't bigger than any of the keys which means it's in the last index.
+	return false, len(n.items)
+}
+```
+`bytes.Compare` 메서드는 a와 b 바이트를 `lexicographically`(사전순으로) 비교해주는데, 만약 서로 같으면 0, a < b이면 -1을, a > b이면 +1을 반환한다.
+
+즉, 우리는 node에서의 key와 찾으려는 key를 비교하여 child pointer의 인덱스를 넘겨준다. 따라서, 매칭되면 더이상 child pointer로 나아갈 이유가 없으므로 `true`를 반환해주고, res가 1이 나오면 찾으려는 key가 현재 node의 키보다 작으므로 `false`와 이전 child pointer인 `i`를 반환한다. 만약 `for`을 모두 순회하고도 결과가 안나왔다면 res는 여태까지 `-1`만 나왔다는 것이다. 이는 `a<b`라는 의미로, 현재 node의 키값보다 찾으려는 키값이 더 크다는 의미이므로, `child pointer`로 `len(n.items)`를 반환해주는 것이다.
+
+다만 현재의 코드는 `node`안에서만 키값을 비교하면서 찾는 것이다. 이제 `b-tree`의 모든 노드를 순회하도록 하자. 
+
+`b-tree`의 순회는 이진 탐색과 다를 바가 없다. 오직 차이점은 검색이 많은 Child들로 이루어져 있다는 것과 투개로만 이루어져 있다는 게 아니라는 것이다.
+
+```go
+// findKey searches for a key inside the tree. Once the key is found, the parent node and the correct index are returned
+// so the key itself can be accessed in the following way parent[index].
+// If the key isn't found, a falsey answer is returned.
+func (n *Node) findKey(key []byte) (int, *Node, error) {
+	index, node, err := findKeyHelper(n, key)
+	if err != nil {
+		return -1, nil, err
+	}
+	return index, node, nil
+
+}
+
+func findKeyHelper(node *Node, key []byte) (int, *Node, error) {
+	//Search for the key inside the node
+	wasFound, index := node.findKeyInNode(key)
+	if wasFound {
+		return index, node, nil
+	}
+	// If we reached a leaf node and the key wasn't found, it means it doesn't exist.
+	if node.isLeaf() {
+		return -1, nil, nil
+	}
+	// Else keep searching the tree
+	nextChild, err := node.getNode(node.childNodes[index])
+	if err != nil {
+		return -1, nil, err
+	}
+	return findKeyHelper(nextChild, key)
+}
+```
+`fineKey`함수는 `findKeyHelper` 함수의 wrapper이다. `findKeyHelper`는 제귀적으로 `node`를 따라가서 검색 알고리즘을 해준다.
+
+`root`노드로 부터 시작되어야 하지만, `root`노드에는 parent node가 없다. 따라서 어딘가에 `root` node에 대한 정보를 기록해야하므로 `meta`에 `root`정보를 기록하도록 하자.
+
+`root` 노드의 page number를 `meta`에 저장하도록 하자.
+
+- meta.go
+```go
+type meta struct {
+	root         pgnum
+	freelistPage pgnum
+}
+
+func newEmptyMeta() *meta {
+	return &meta{}
+}
+
+func (m *meta) serialize(buf []byte) {
+	pos := 0
+
+	binary.LittleEndian.PutUint64(buf[pos:], uint64(m.root))
+	pos += pageNumSize
+
+	binary.LittleEndian.PutUint64(buf[pos:], uint64(m.freelistPage))
+	pos += pageNumSize
+}
+
+func (m *meta) deserialize(buf []byte) {
+	pos := 0
+	m.root = pgnum(binary.LittleEndian.Uint64(buf[pos:]))
+	pos += pageNumSize
+
+	m.freelistPage = pgnum(binary.LittleEndian.Uint64(buf[pos:]))
+	pos += pageNumSize
+}
+```
+이제 `root`도 기록하였고, 우리의 메서드를 테스트해보도록 하자. 우리의 DB는 이제 `B-Tree`를 활용하여 검색을 시도할 것이고, `B-Tree` 형식안에 놓여져 있는 database page를 반환하게 된다.
+
+우리는 아직 `B-tree`를 만들 방법이 없다. 그래서 `mainTest`라는 mock file을 준비해두었다. 이 파일은 `key-value`쌍을 포함하고 있다. `key`는 "Key1"이고 `value`는 "Value1"이다.
+
+그전에 `newDal`의 일부분을 다음과 같이 변경하도록 하자.
+
+- dal.go
+```go
+func newDal(path string) (*dal, error) {
+	dal := &dal{
+		meta:     newEmptyMeta(),
+		pageSize: os.Getpagesize(),
+	}
+	...
+}
+```
+
+이제 `main.go` 코드를 변경하여 `mainTest₩를 사용할 수 있도록 하자.
+
+- main.go
+```go
+package main
+
+import "fmt"
+
+func main() {
+	dal, _ := newDal("./mainTest")
+
+	node, _ := dal.getNode(dal.root)
+	node.dal = dal
+	index, containingNode, _ := node.findKey([]byte("Key1"))
+	res := containingNode.items[index]
+
+	fmt.Printf("key is: %s, value is: %s\n", res.key, res.value)
+	_ = dal.close()
+}
+```
+이제 코드를 실행하여 `Key1`, `value1`이 나오면 우리가 만든 `b-tree` node의 구조와 순회, 검색, 저장, 불러오기 등이 잘 만들어진 것을 확인할 수 있다.

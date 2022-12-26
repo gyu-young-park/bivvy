@@ -20,10 +20,10 @@ type dal struct {
 	*meta
 }
 
-func newDal(path string, pageSize int) (*dal, error) {
+func newDal(path string) (*dal, error) {
 	dal := &dal{
 		meta:     newEmptyMeta(),
-		pageSize: pageSize,
+		pageSize: os.Getpagesize(),
 	}
 	// exist
 	if _, err := os.Stat(path); err == nil {
