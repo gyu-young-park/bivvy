@@ -179,7 +179,30 @@ func (n *Node) findKey(key []byte) (int, *Node, error) {
 		return -1, nil, err
 	}
 	return index, node, nil
+}
 
+// elementSize returns the size of a key-value-childNode triplet at a given index.
+// If the node is a leaf, then the size of a key-value pair is returned.
+// It's assumed i <= len(n.items)
+func (n *Node) elementSize(i int) int {
+	size := 0
+	size += len(n.items[i].key)
+	size += len(n.items[i].value)
+	size += pageNumSize
+	return size
+}
+
+// nodeSize returns the node's size in bytes
+func (n *Node) nodeSize() int {
+	size := 0
+	size += nodeHeaderSize
+
+	for i := range n.items {
+		size += n.elementSize(i)
+	}
+	// Add last page
+	size += n.pageSize // 8 is the pgnum size
+	return size
 }
 
 func findKeyHelper(node *Node, key []byte) (int, *Node, error) {

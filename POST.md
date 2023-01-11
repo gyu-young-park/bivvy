@@ -1056,3 +1056,98 @@ func main() {
 }
 ```
 이제 코드를 실행하여 `Key1`, `value1`이 나오면 우리가 만든 `b-tree` node의 구조와 순회, 검색, 저장, 불러오기 등이 잘 만들어진 것을 확인할 수 있다.
+
+## chapter 4
+이전 챕터에서는 우리는 B-tree에 대해서 알아봤다. b-tree는 node가 두 children 이상을 가질 수 있게하는 이진 탐색 트리의 일반화이다. 트리 높이는 최소화되었기 때문에 disk 접근을 감소시킬 수 있었다.
+
+우리는 또한 slotted page들에 대해서 알아보았다. 
+
+마지막으로, 우리는 b-tree의 가장 기본적인 연산인 search, insertion, delete를 구현할 예정이다. 이전 chapter에서 우리는 search 기능을 구현하였다. 이제 insertion를 구현해보도록 하자.
+
+### Problem
+새로운 데이터를 추가하는 것은 node가 너무 많은 데이터를 가지게 할 수 있다. 가령, 모든 새로운 쌍들이 같은 node에 삽입될 수 있을 때가 있다.
+
+이는 연산들을 느리게 할 수 있다. 이외에도 심각한 문제를 가져올 수 있는데, nodes들은 고정된 사이즈의 database page들로 변환된다. 그래서 키-값 쌍의 전체 크기에 기반하는 각 노드들의 양에 제한이 있게 된다.
+
+![사진2](./pic/chapter4/1.png)
+삭제도 같은 문제를 갖는다. 같은 노드에서의 키-값 쌍의 삭제는 노드를 감소시켜 매우 적은 키-값 쌍을 갖게된다. 이 시점에서이 쌍을 다른 노드에 어떤 방식이든 재할당하는 것이 좋다.
+
+노드가 최대, 최소의 키-값 쌍을 갖고 있는 지 없는 지를 알기위해서 우리는 먼저 이를 알기위한 구조체를 만들어야 한다. 우리는 page size의 퍼센트 upper, lower threshold를 추가할 것이다.
+
+코드에서 우리는 `Options`를 추가하며 이는 user에 의해서 초기화되고 우리의 db init function에 사용된다.
+
+- dal.go
+```go
+type Options struct {
+	pageSize       int
+	MinFillPercent float32
+	MaxFillPercent float32
+}
+
+var DefaultOptions = &Options{
+	MinFillPercent: 0.5,
+	MaxFillPercent: 0.95,
+}
+
+type dal struct {
+	file           *os.File
+	pageSize       int
+	minFillPercent float32
+	maxFillPercent float32
+	*freelist
+	*meta
+}
+```
+
+- dal.go
+```go
+func newDal(path string, options *Options) (*dal, error) {
+	dal := &dal{
+		meta:           newEmptyMeta(),
+		pageSize:       options.pageSize,
+		minFillPercent: options.MinFillPercent,
+		maxFillPercent: options.MaxFillPercent,
+	}
+	...
+```
+또한 `dal`과 `node`에 byte로 node size를 계산하고, threshold와 비교하는 새로운 메서드들을 추가할 것이다. `elementSize`는 주어진 인덱스에 해당하는 단일 key-value-child 세쌍의 사이즈를 계산한다. `nodeSize`은 node header size와 모든 key, value 그리고 child node들의 사이즈를 더한다.
+
+node의 header size인 3을 `const.go`에 먼저 정의하도록 하자.
+
+- const.go
+```go
+const (
+	nodeHeaderSize = 3
+	pageNumSize = 8
+)
+```
+
+다음으로 `node.go`에 `elementSize`와 `nodeSize` 메서드를 추가하자.
+- node.go
+```go
+// elementSize returns the size of a key-value-childNode triplet at a given index.
+// If the node is a leaf, then the size of a key-value pair is returned.
+// It's assumed i <= len(n.items)
+func (n *Node) elementSize(i int) int {
+	size := 0
+	size += len(n.items[i].key)
+	size += len(n.items[i].value)
+	size += pageNumSize
+	return size
+}
+
+// nodeSize returns the node's size in bytes
+func (n *Node) nodeSize() int {
+	size := 0
+	size += nodeHeaderSize
+
+	for i := range n.items {
+		size += n.elementSize(i)
+	}
+	// Add last page
+	size += n.pageSize // 8 is the pgnum size
+	return size
+}
+```
+
+### Solution

@@ -3,7 +3,8 @@ package main
 import "fmt"
 
 func main() {
-	dal, _ := newDal("./mainTest")
+	opt := Options{}
+	dal, _ := newDal("./mainTest", &opt)
 
 	node, _ := dal.getNode(dal.root)
 	node.dal = dal
